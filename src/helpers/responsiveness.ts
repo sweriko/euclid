@@ -1,0 +1,22 @@
+import { WebGPURenderer } from 'three/webgpu';
+
+let previousWidth = 0;
+let previousHeight = 0;
+
+export function resizeRendererToDisplaySize(renderer: WebGPURenderer, pixelRatio: number) {
+  const canvas = renderer.domElement;
+  const container = canvas.parentElement!;
+  const width = container.clientWidth;
+  const height = container.clientHeight;
+  const needResize = previousWidth !== width || previousHeight !== height;
+  if (needResize) {
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    renderer.setSize(width, height, true);
+    renderer.setSize(Math.round(width * pixelRatio), Math.round(height * pixelRatio), false);
+    previousWidth = width;
+    previousHeight = height;
+  }
+  return needResize;
+}
+

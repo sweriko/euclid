@@ -1,0 +1,35 @@
+{
+  "name": "noneuclid",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@types/three": "0.181.0",
+    "typescript": "5.9.2",
+    "vite": "7.1.5"
+  },
+  "dependencies": {
+    "three": "^0.181.0",
+    "@dimforge/rapier3d-compat": "^0.14.0"
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
