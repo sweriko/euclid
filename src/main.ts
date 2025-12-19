@@ -24,7 +24,7 @@ import {
   Discard,
 } from 'three/tsl';
 import RAPIER from '@dimforge/rapier3d-compat';
-import { FPSController, RoomBounds, OuterRoomObstacle } from './character/FPSController';
+import { FPSController, RoomBounds } from './character/FPSController';
 import { resizeRendererToDisplaySize } from './helpers/responsiveness';
 
 // ============================================
@@ -32,8 +32,8 @@ import { resizeRendererToDisplaySize } from './helpers/responsiveness';
 // ============================================
 const DOOR_WIDTH = 0.9;
 const DOOR_HEIGHT = 1.6;
-const OUTER_ROOM_SIZE = 1.2;  // Width and depth of outer box
-const OUTER_ROOM_HEIGHT = DOOR_HEIGHT + 0.2;  // Slightly taller than door
+const OUTER_DOOR_FRAME_THICKNESS = 0.12;
+const OUTER_DOOR_FRAME_DEPTH = 0.2;
 // Inner room: 6m wide, 10m deep, 6m tall
 const INNER_ROOM_WIDTH = 6;
 const INNER_ROOM_DEPTH = 10;
@@ -44,7 +44,7 @@ let portalRenderHeight = 1024;
 
 
 // Portal positions (z coordinate of the door plane)
-const OUTER_PORTAL_Z = OUTER_ROOM_SIZE / 2;
+const OUTER_PORTAL_Z = 0.6;
 const INNER_PORTAL_Z = INNER_ROOM_DEPTH / 2;
 
 // Separate the inner world to avoid overlap (like Godot demo at z=48)
@@ -64,20 +64,6 @@ const INNER_ROOM_BOUNDS: RoomBounds = {
   doorMaxX: DOOR_WIDTH / 2,
   doorMaxY: DOOR_HEIGHT,
   doorZ: INNER_WORLD_OFFSET + INNER_PORTAL_Z,
-};
-
-// Outer room obstacle (small cube that blocks from outside)
-const OUTER_ROOM_OBSTACLE: OuterRoomObstacle = {
-  minX: -OUTER_ROOM_SIZE / 2,
-  maxX: OUTER_ROOM_SIZE / 2,
-  minY: 0,
-  maxY: OUTER_ROOM_HEIGHT,
-  minZ: -OUTER_ROOM_SIZE / 2,
-  maxZ: OUTER_ROOM_SIZE / 2,
-  doorMinX: -DOOR_WIDTH / 2,
-  doorMaxX: DOOR_WIDTH / 2,
-  doorMaxY: DOOR_HEIGHT,
-  doorZ: OUTER_PORTAL_Z,
 };
 
 // ============================================
@@ -201,7 +187,8 @@ function createPortalMaterial(renderTarget: RenderTarget): MeshBasicNodeMaterial
   const material = new MeshBasicNodeMaterial();
   // Use screen UV so the portal acts like a window - texture is sampled based on screen position
   material.colorNode = texture(renderTarget.texture, screenUV);
-  material.side = THREE.DoubleSide;
+  // Only render the portal from the "front" side so you can't see through it from behind
+  material.side = THREE.FrontSide;
   return material;
 }
 
@@ -280,6 +267,33 @@ function createRoomWithDoorGeometry(
   return merged;
 }
 
+function createDoorFrameGeometry(
+  doorWidth: number,
+  doorHeight: number,
+  frameThickness: number,
+  frameDepth: number
+): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [];
+  const postHeight = doorHeight + frameThickness;
+  
+  const leftPost = new THREE.BoxGeometry(frameThickness, postHeight, frameDepth);
+  leftPost.translate(-doorWidth / 2 - frameThickness / 2, postHeight / 2, 0);
+  parts.push(leftPost);
+  
+  const rightPost = new THREE.BoxGeometry(frameThickness, postHeight, frameDepth);
+  rightPost.translate(doorWidth / 2 + frameThickness / 2, postHeight / 2, 0);
+  parts.push(rightPost);
+  
+  const topBeam = new THREE.BoxGeometry(doorWidth + frameThickness * 2, frameThickness, frameDepth);
+  topBeam.translate(0, doorHeight + frameThickness / 2, 0);
+  parts.push(topBeam);
+  
+  const merged = mergeGeometries(parts);
+  parts.forEach(p => p.dispose());
+  
+  return merged;
+}
+
 // ============================================
 // CREATE SCENE OBJECTS
 // ============================================
@@ -293,18 +307,17 @@ function createOuterWorld(): THREE.Group {
   const ground = new THREE.Mesh(groundGeometry, groundMaterial);
   group.add(ground);
   
-  // Outer room
-  const roomGeometry = createRoomWithDoorGeometry(
-    OUTER_ROOM_SIZE,
-    OUTER_ROOM_HEIGHT,
-    OUTER_ROOM_SIZE,
+  // Outer portal frame (no outer "room" box)
+  const frameGeometry = createDoorFrameGeometry(
     DOOR_WIDTH,
-    DOOR_HEIGHT
+    DOOR_HEIGHT,
+    OUTER_DOOR_FRAME_THICKNESS,
+    OUTER_DOOR_FRAME_DEPTH
   );
-  const roomMaterial = createOuterRoomMaterial();
-  const roomMesh = new THREE.Mesh(roomGeometry, roomMaterial);
-  roomMesh.position.set(0, OUTER_ROOM_HEIGHT / 2, 0);
-  group.add(roomMesh);
+  const frameMaterial = createOuterRoomMaterial();
+  const frameMesh = new THREE.Mesh(frameGeometry, frameMaterial);
+  frameMesh.position.set(0, 0, OUTER_PORTAL_Z);
+  group.add(frameMesh);
   
   return group;
 }
@@ -464,8 +477,8 @@ function setupPhysics(): void {
     groundBody
   );
   
-  // Create outer room collision
-  createOuterRoomCollision();
+  // Create outer doorframe collision
+  createOuterDoorFrameCollision();
   
   // Create inner room collision
   createInnerRoomCollision();
@@ -487,7 +500,6 @@ function setupPhysics(): void {
   );
   
   controller.setBounds(null);
-  controller.outerRoomObstacle = OUTER_ROOM_OBSTACLE;
   
   // Create pushable cube
   createPushableCube();
@@ -635,12 +647,13 @@ function teleportCubeToOuter(): void {
   pushCubeInInnerWorld = false;
 }
 
-function createOuterRoomCollision(): void {
-  const wallThickness = 0.15;
-  const hw = OUTER_ROOM_SIZE / 2;
-  const hh = OUTER_ROOM_HEIGHT / 2;
-  const hd = OUTER_ROOM_SIZE / 2;
-  const doorHW = DOOR_WIDTH / 2;
+function createOuterDoorFrameCollision(): void {
+  const t = OUTER_DOOR_FRAME_THICKNESS;
+  const d = OUTER_DOOR_FRAME_DEPTH;
+  
+  const postHeight = DOOR_HEIGHT + t;
+  const postY = postHeight / 2;
+  const postZ = OUTER_PORTAL_Z;
   
   const addCollider = (hx: number, hy: number, hz: number, x: number, y: number, z: number) => {
     const body = physicsWorld.createRigidBody(
@@ -652,30 +665,35 @@ function createOuterRoomCollision(): void {
     );
   };
   
-  // Back wall
-  addCollider(OUTER_ROOM_SIZE / 2, OUTER_ROOM_HEIGHT / 2, wallThickness / 2, 0, hh, -hd - wallThickness / 2);
+  // Left post
+  addCollider(
+    t / 2,
+    postHeight / 2,
+    d / 2,
+    -DOOR_WIDTH / 2 - t / 2,
+    postY,
+    postZ
+  );
   
-  // Left wall
-  addCollider(wallThickness / 2, OUTER_ROOM_HEIGHT / 2, OUTER_ROOM_SIZE / 2, -hw - wallThickness / 2, hh, 0);
+  // Right post
+  addCollider(
+    t / 2,
+    postHeight / 2,
+    d / 2,
+    DOOR_WIDTH / 2 + t / 2,
+    postY,
+    postZ
+  );
   
-  // Right wall
-  addCollider(wallThickness / 2, OUTER_ROOM_HEIGHT / 2, OUTER_ROOM_SIZE / 2, hw + wallThickness / 2, hh, 0);
-  
-  // Front wall - left section
-  const sideWidth = hw - doorHW;
-  if (sideWidth > 0.05) {
-    addCollider(sideWidth / 2, OUTER_ROOM_HEIGHT / 2, wallThickness / 2, -doorHW - sideWidth / 2, hh, hd + wallThickness / 2);
-    addCollider(sideWidth / 2, OUTER_ROOM_HEIGHT / 2, wallThickness / 2, doorHW + sideWidth / 2, hh, hd + wallThickness / 2);
-  }
-  
-  // Front wall - top section
-  const topHeight = OUTER_ROOM_HEIGHT - DOOR_HEIGHT;
-  if (topHeight > 0.05) {
-    addCollider(DOOR_WIDTH / 2, topHeight / 2, wallThickness / 2, 0, DOOR_HEIGHT + topHeight / 2, hd + wallThickness / 2);
-  }
-  
-  // Ceiling
-  addCollider(OUTER_ROOM_SIZE / 2, wallThickness / 2, OUTER_ROOM_SIZE / 2, 0, OUTER_ROOM_HEIGHT + wallThickness / 2, 0);
+  // Top beam
+  addCollider(
+    (DOOR_WIDTH + t * 2) / 2,
+    t / 2,
+    d / 2,
+    0,
+    DOOR_HEIGHT + t / 2,
+    postZ
+  );
 }
 
 function createInnerRoomCollision(): void {

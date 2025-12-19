@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 /**
  * Creates a box room geometry with walls facing inward and a door cutout
@@ -71,7 +72,7 @@ export function createRoomWithDoor(
   geometries.push(topSection);
   
   // Merge all geometries
-  const merged = THREE.BufferGeometryUtils.mergeGeometries(geometries);
+  const merged = mergeGeometries(geometries);
   
   // Clean up
   geometries.forEach(g => g.dispose());

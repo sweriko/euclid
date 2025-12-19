@@ -202,7 +202,7 @@ export class FPSController {
       this.collider,
       desiredMovement,
       RAPIER.QueryFilterFlags.EXCLUDE_SENSORS,
-      null // filter groups
+      undefined // filter groups
     );
     
     // Get corrected movement
