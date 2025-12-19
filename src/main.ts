@@ -1,12 +1,7 @@
 import * as THREE from "three";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import Stats from "three/examples/jsm/libs/stats.module.js";
-import {
-  WebGPURenderer,
-  MeshStandardNodeMaterial,
-  MeshBasicNodeMaterial,
-  RenderTarget,
-} from "three/webgpu";
+import { WebGPURenderer, MeshStandardNodeMaterial } from "three/webgpu";
 import {
   color,
   normalWorld,
@@ -16,8 +11,6 @@ import {
   smoothstep,
   sin,
   time,
-  texture,
-  screenUV,
   positionWorld,
   Fn,
   If,
@@ -26,6 +19,7 @@ import {
 import RAPIER from "@dimforge/rapier3d-compat";
 import { FPSController, RoomBounds } from "./character/FPSController";
 import { resizeRendererToDisplaySize } from "./helpers/responsiveness";
+import { Portal, computeObliqueProjectionMatrix } from "./portal";
 
 // ============================================
 // CONSTANTS
@@ -34,24 +28,21 @@ const DOOR_WIDTH = 0.9;
 const DOOR_HEIGHT = 1.6;
 const OUTER_DOOR_FRAME_THICKNESS = 0.12;
 const OUTER_DOOR_FRAME_DEPTH = 0.2;
-// Inner room: 6m wide, 10m deep, 6m tall
+
+// Inner room: spacious cabin (like TARDIS - bigger on the inside)
 const INNER_ROOM_WIDTH = 6;
 const INNER_ROOM_DEPTH = 10;
 const INNER_ROOM_HEIGHT = 6;
 const GROUND_SIZE = 50;
-let portalRenderWidth = 1024;
-let portalRenderHeight = 1024;
 
 // Portal positions (z coordinate of the door plane)
 const OUTER_PORTAL_Z = 0.6;
 const INNER_PORTAL_Z = INNER_ROOM_DEPTH / 2;
 
-// Separate the inner world to avoid overlap (like Godot demo at z=48)
+// Separate the inner world to avoid overlap
 const INNER_WORLD_OFFSET = 100;
 
-// Room bounds for collision (inner room - player is inside)
-// Door is same size on both sides (small door in big room)
-// Note: bounds are in world space with INNER_WORLD_OFFSET applied
+// Room bounds for collision (inner room)
 const INNER_ROOM_BOUNDS: RoomBounds = {
   minX: -INNER_ROOM_WIDTH / 2,
   maxX: INNER_ROOM_WIDTH / 2,
@@ -75,32 +66,32 @@ let camera: THREE.PerspectiveCamera;
 let portalCamera: THREE.PerspectiveCamera;
 let physicsWorld: RAPIER.World;
 let controller: FPSController;
-let portalRenderTarget: RenderTarget;
-let portalMesh: THREE.Mesh;
-let portalMaterial: MeshBasicNodeMaterial;
-let portalDebugOutline: THREE.LineSegments;
-let innerSphere: THREE.Mesh;
-let outerSphere: THREE.Mesh;
 let stats: Stats;
 
-// Clipping plane for portal camera (clips geometry behind the destination portal)
-let portalClipPlane: THREE.Plane;
+// Portals
+let outerPortal: Portal;
+let innerPortal: Portal;
+
+// Animated objects
+let innerSphere: THREE.Mesh;
+let outerSphere: THREE.Mesh;
+let outerSphereMaterial: MeshStandardNodeMaterial;
+let innerSphereMaterial: MeshStandardNodeMaterial;
 
 // Pushable cube
 let pushCubeBody: RAPIER.RigidBody;
 let pushCubeMeshOuter: THREE.Mesh;
 let pushCubeMeshInner: THREE.Mesh;
+let pushCubeOuterMaterial: MeshStandardNodeMaterial;
+let pushCubeInnerMaterial: MeshStandardNodeMaterial;
 let pushCubeInInnerWorld = false;
 const PUSH_CUBE_SIZE = 0.3;
 
-// Debug settings
-const DEBUG_PORTAL_OUTLINE = false;
-
 // Track which world the player is in
 let isInInnerRoom = false;
-let lastPortalSide = 1; // 1 = in front of portal (visible side), -1 = behind portal
-let sphereDistFromPortal = 0; // For controlling sphere visibility
+let lastPortalSide = 1;
 
+// Input state
 const inputState = {
   forward: false,
   backward: false,
@@ -115,7 +106,7 @@ let pendingMouseX = 0;
 let pendingMouseY = 0;
 
 // ============================================
-// CREATE MATERIALS WITH TSL
+// MATERIALS
 // ============================================
 function createOuterRoomMaterial(): MeshStandardNodeMaterial {
   const material = new MeshStandardNodeMaterial();
@@ -157,7 +148,6 @@ function createInnerRoomMaterial(): MeshStandardNodeMaterial {
   material.metalnessNode = float(0.05);
   material.side = THREE.DoubleSide;
 
-  // Prevent z-fighting with door frames
   material.polygonOffset = true;
   material.polygonOffsetFactor = 1;
   material.polygonOffsetUnits = 1;
@@ -181,7 +171,6 @@ function createGroundMaterial(): MeshStandardNodeMaterial {
   material.roughnessNode = float(0.9);
   material.metalnessNode = float(0.0);
 
-  // Prevent z-fighting with door frames and other geometry at floor level
   material.polygonOffset = true;
   material.polygonOffsetFactor = 1;
   material.polygonOffsetUnits = 1;
@@ -189,23 +178,74 @@ function createGroundMaterial(): MeshStandardNodeMaterial {
   return material;
 }
 
-function createPortalMaterial(
-  renderTarget: RenderTarget
-): MeshBasicNodeMaterial {
-  const material = new MeshBasicNodeMaterial();
-  // Use screen UV so the portal acts like a window - texture is sampled based on screen position
-  material.colorNode = texture(renderTarget.texture, screenUV);
-  // Only render the portal from the "front" side so you can't see through it from behind
-  material.side = THREE.FrontSide;
-  // Push portal slightly back in depth buffer to prevent z-fighting with scene geometry
-  material.polygonOffset = true;
-  material.polygonOffsetFactor = -1;
-  material.polygonOffsetUnits = -1;
+/**
+ * Create a material that clips at the portal plane.
+ * Used for objects that cross through the portal.
+ */
+function createClippedSphereMaterial(
+  clipZ: number,
+  keepFront: boolean
+): MeshStandardNodeMaterial {
+  const material = new MeshStandardNodeMaterial();
+  const hueShift = sin(time.mul(0.5)).mul(0.1).add(0.55);
+
+  const clipPlaneZ = float(clipZ);
+
+  material.colorNode = Fn(() => {
+    if (keepFront) {
+      If(positionWorld.z.lessThan(clipPlaneZ), () => {
+        Discard();
+      });
+    } else {
+      If(positionWorld.z.greaterThan(clipPlaneZ), () => {
+        Discard();
+      });
+    }
+    return vec3(hueShift, float(0.3), float(0.7));
+  })();
+
+  material.roughnessNode = float(0.2);
+  material.metalnessNode = float(0.8);
+  material.emissiveNode = vec3(hueShift.mul(0.2), float(0.05), float(0.1));
+  material.side = THREE.DoubleSide;
+
+  return material;
+}
+
+function createPushCubeMaterial(
+  clipZ: number | null,
+  keepFront: boolean
+): MeshStandardNodeMaterial {
+  const material = new MeshStandardNodeMaterial();
+  const baseColor = color(0xe07030);
+
+  if (clipZ !== null) {
+    const clipPlaneZ = float(clipZ);
+    material.colorNode = Fn(() => {
+      if (keepFront) {
+        If(positionWorld.z.lessThan(clipPlaneZ), () => {
+          Discard();
+        });
+      } else {
+        If(positionWorld.z.greaterThan(clipPlaneZ), () => {
+          Discard();
+        });
+      }
+      return baseColor;
+    })();
+  } else {
+    material.colorNode = baseColor;
+  }
+
+  material.roughnessNode = float(0.4);
+  material.metalnessNode = float(0.1);
+  material.side = THREE.DoubleSide;
+
   return material;
 }
 
 // ============================================
-// CREATE ROOM GEOMETRIES
+// GEOMETRY CREATION
 // ============================================
 function createRoomWithDoorGeometry(
   width: number,
@@ -319,7 +359,7 @@ function createDoorFrameGeometry(
 }
 
 // ============================================
-// CREATE SCENE OBJECTS
+// SCENE CREATION
 // ============================================
 function createOuterWorld(): THREE.Group {
   const group = new THREE.Group();
@@ -331,7 +371,7 @@ function createOuterWorld(): THREE.Group {
   const ground = new THREE.Mesh(groundGeometry, groundMaterial);
   group.add(ground);
 
-  // Outer portal frame (no outer "room" box)
+  // Outer portal frame
   const frameGeometry = createDoorFrameGeometry(
     DOOR_WIDTH,
     DOOR_HEIGHT,
@@ -349,12 +389,11 @@ function createOuterWorld(): THREE.Group {
 function createInnerWorld(): THREE.Group {
   const group = new THREE.Group();
 
-  // Inner room - same small door as outside (non-Euclidean!)
   const roomGeometry = createRoomWithDoorGeometry(
     INNER_ROOM_WIDTH,
     INNER_ROOM_HEIGHT,
     INNER_ROOM_DEPTH,
-    DOOR_WIDTH, // Same door size as outside
+    DOOR_WIDTH,
     DOOR_HEIGHT
   );
   const roomMaterial = createInnerRoomMaterial();
@@ -369,7 +408,7 @@ function createInnerWorld(): THREE.Group {
 }
 
 function addInteriorObjects(group: THREE.Group): void {
-  // Columns for 6x10x6 room
+  // Columns
   const columnGeometry = new THREE.CylinderGeometry(
     0.2,
     0.25,
@@ -394,24 +433,24 @@ function addInteriorObjects(group: THREE.Group): void {
     group.add(column);
   });
 
-  // Animated sphere - flies back and forth
+  // Animated sphere (inside the inner room)
   const sphereGeometry = new THREE.SphereGeometry(0.4, 32, 32);
-  const sphereMaterial = new MeshStandardNodeMaterial();
+  innerSphereMaterial = new MeshStandardNodeMaterial();
   const hueShift = sin(time.mul(0.5)).mul(0.1).add(0.55);
-  sphereMaterial.colorNode = vec3(hueShift, float(0.3), float(0.7));
-  sphereMaterial.roughnessNode = float(0.2);
-  sphereMaterial.metalnessNode = float(0.8);
-  sphereMaterial.emissiveNode = vec3(
+  innerSphereMaterial.colorNode = vec3(hueShift, float(0.3), float(0.7));
+  innerSphereMaterial.roughnessNode = float(0.2);
+  innerSphereMaterial.metalnessNode = float(0.8);
+  innerSphereMaterial.emissiveNode = vec3(
     hueShift.mul(0.2),
     float(0.05),
     float(0.1)
   );
 
-  innerSphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+  innerSphere = new THREE.Mesh(sphereGeometry, innerSphereMaterial);
   innerSphere.position.set(0, 2.5, -2);
   group.add(innerSphere);
 
-  // Furniture - larger tables/pedestals
+  // Furniture
   const cubeGeometry = new THREE.BoxGeometry(1.2, 0.8, 1.2);
   const cubeMaterial = new MeshStandardNodeMaterial();
   cubeMaterial.colorNode = color(0x5c4033);
@@ -428,49 +467,6 @@ function addInteriorObjects(group: THREE.Group): void {
     cube.position.set(pos[0], pos[1], pos[2]);
     group.add(cube);
   });
-}
-
-function createPortalPlane(
-  renderTarget: RenderTarget,
-  width: number,
-  height: number
-): THREE.Mesh {
-  const geometry = new THREE.PlaneGeometry(width, height);
-  geometry.translate(0, height / 2, 0);
-
-  portalMaterial = createPortalMaterial(renderTarget);
-
-  const mesh = new THREE.Mesh(geometry, portalMaterial);
-  return mesh;
-}
-
-function createPortalDebugOutline(
-  width: number,
-  height: number
-): THREE.LineSegments {
-  const hw = width / 2;
-
-  const v0 = new THREE.Vector3(-hw, 0, 0);
-  const v1 = new THREE.Vector3(hw, 0, 0);
-  const v2 = new THREE.Vector3(hw, height, 0);
-  const v3 = new THREE.Vector3(-hw, height, 0);
-
-  const points = [v0, v1, v1, v2, v2, v3, v3, v0, v0, v2];
-
-  const geometry = new THREE.BufferGeometry().setFromPoints(points);
-
-  const material = new THREE.LineBasicMaterial({
-    color: 0x00ff00,
-    linewidth: 2,
-    depthTest: false,
-    transparent: true,
-    opacity: 0.8,
-  });
-
-  const lines = new THREE.LineSegments(geometry, material);
-  lines.renderOrder = 999;
-
-  return lines;
 }
 
 function createLighting(scene: THREE.Scene, isInner: boolean): void {
@@ -502,6 +498,38 @@ function createLighting(scene: THREE.Scene, isInner: boolean): void {
 }
 
 // ============================================
+// PORTAL SETUP
+// ============================================
+function setupPortals(): void {
+  // Create outer portal (in the outer world, facing +Z)
+  outerPortal = new Portal(
+    "outer",
+    DOOR_WIDTH,
+    DOOR_HEIGHT,
+    new THREE.Vector3(0, 0, OUTER_PORTAL_Z),
+    new THREE.Euler(0, 0, 0)
+  );
+  outerPortal.scene = outerScene;
+
+  // Create inner portal (in the inner world, facing -Z / toward room interior)
+  innerPortal = new Portal(
+    "inner",
+    DOOR_WIDTH,
+    DOOR_HEIGHT,
+    new THREE.Vector3(0, 0, INNER_WORLD_OFFSET + INNER_PORTAL_Z),
+    new THREE.Euler(0, Math.PI, 0) // Rotated to face into the room
+  );
+  innerPortal.scene = innerScene;
+
+  // Link portals
+  outerPortal.link(innerPortal);
+
+  // Add portal meshes to scenes
+  outerScene.add(outerPortal.mesh);
+  innerScene.add(innerPortal.mesh);
+}
+
+// ============================================
 // PHYSICS SETUP
 // ============================================
 function setupPhysics(): void {
@@ -518,10 +546,7 @@ function setupPhysics(): void {
     groundBody
   );
 
-  // Create outer doorframe collision
   createOuterDoorFrameCollision();
-
-  // Create inner room collision
   createInnerRoomCollision();
 
   controller = new FPSController(physicsWorld, new THREE.Vector3(0, 1, 5), {
@@ -538,7 +563,6 @@ function setupPhysics(): void {
 
   controller.setBounds(null);
 
-  // Create pushable cube
   createPushableCube();
 }
 
@@ -601,17 +625,13 @@ function updatePushableCube(): void {
 
       const curVel = pushCubeBody.linvel();
       pushCubeBody.setLinvel(
-        {
-          x: pushDir.x * pushSpeed,
-          y: curVel.y,
-          z: pushDir.z * pushSpeed,
-        },
+        { x: pushDir.x * pushSpeed, y: curVel.y, z: pushDir.z * pushSpeed },
         true
       );
     }
   }
 
-  // Check if cube should teleport through portal
+  // Check portal crossing for cube
   const portalZ = pushCubeInInnerWorld
     ? INNER_WORLD_OFFSET + INNER_PORTAL_Z
     : OUTER_PORTAL_Z;
@@ -638,7 +658,14 @@ function updatePushableCube(): void {
     }
   }
 
-  // Calculate distance from portal for positioning both meshes
+  // Update cube visibility and clipping
+  updateCubeVisuals(pos, rot);
+}
+
+function updateCubeVisuals(
+  pos: { x: number; y: number; z: number },
+  rot: { x: number; y: number; z: number; w: number }
+): void {
   const cubeHalfSize = PUSH_CUBE_SIZE / 2;
   let distFromPortal: number;
 
@@ -655,6 +682,7 @@ function updatePushableCube(): void {
   const usePortalVisuals = cubeInDoorArea && nearPortalZ;
 
   if (usePortalVisuals) {
+    // Outer mesh: show part in front of outer portal
     pushCubeMeshOuter.position.set(
       pos.x,
       pos.y,
@@ -662,6 +690,7 @@ function updatePushableCube(): void {
     );
     pushCubeMeshOuter.quaternion.set(rot.x, rot.y, rot.z, rot.w);
 
+    // Inner mesh: show part behind inner portal (in room)
     pushCubeMeshInner.position.set(
       pos.x,
       pos.y,
@@ -733,7 +762,6 @@ function createOuterDoorFrameCollision(): void {
     );
   };
 
-  // Left post
   addCollider(
     t / 2,
     postHeight / 2,
@@ -742,8 +770,6 @@ function createOuterDoorFrameCollision(): void {
     postY,
     postZ
   );
-
-  // Right post
   addCollider(
     t / 2,
     postHeight / 2,
@@ -752,8 +778,6 @@ function createOuterDoorFrameCollision(): void {
     postY,
     postZ
   );
-
-  // Top beam
   addCollider(
     (DOOR_WIDTH + t * 2) / 2,
     t / 2,
@@ -842,7 +866,7 @@ function createInnerRoomCollision(): void {
     oz
   );
 
-  // Front wall - sections around door
+  // Front wall sections around door
   const sideWidth = hw - doorHW;
   if (sideWidth > 0.05) {
     addCollider(
@@ -863,7 +887,7 @@ function createInnerRoomCollision(): void {
     );
   }
 
-  // Front wall - top section
+  // Top section above door
   const topHeight = INNER_ROOM_HEIGHT - doorH;
   if (topHeight > 0.05) {
     addCollider(
@@ -962,23 +986,20 @@ function onPointerLockChange(): void {
 }
 
 // ============================================
-// PORTAL LOGIC
+// PORTAL TRAVERSAL
 // ============================================
-
 function checkPortalTraversal(): void {
   const pos = controller.position;
   const portalZ = isInInnerRoom
     ? INNER_WORLD_OFFSET + INNER_PORTAL_Z
     : OUTER_PORTAL_Z;
 
-  // Portal front face always points toward the player in the current scene:
-  // - outer world: portal faces +Z (player starts at +Z)
-  // - inner world: portal is rotated 180° so it faces -Z (toward room interior)
   const portalNormalZ = isInInnerRoom ? -1 : 1;
   const signedDist = (pos.z - portalZ) * portalNormalZ;
-  const currentSide = signedDist > 0 ? 1 : -1; // 1 = front/visible, -1 = back
+  const currentSide = signedDist > 0 ? 1 : -1;
   const previousSide = lastPortalSide;
   lastPortalSide = currentSide;
+
   const doorHalfWidth = DOOR_WIDTH / 2;
   const doorHeight = DOOR_HEIGHT;
 
@@ -1005,7 +1026,6 @@ function teleportThroughPortal(): void {
     controller.teleport(new THREE.Vector3(pos.x, pos.y, newZ));
     controller.setBounds(null);
     isInInnerRoom = false;
-    // After teleport we always land on the *front/visible* side of the portal in the new world.
     lastPortalSide = 1;
   } else {
     const distFromPortal = pos.z - outerPortalZ;
@@ -1014,66 +1034,159 @@ function teleportThroughPortal(): void {
     controller.teleport(new THREE.Vector3(pos.x, pos.y, newZ));
     controller.setBounds(INNER_ROOM_BOUNDS);
     isInInnerRoom = true;
-    // After teleport we always land on the *front/visible* side of the portal in the new world.
     lastPortalSide = 1;
   }
 }
 
-function updatePortalCamera(): void {
-  const mainCamPos = camera.position.clone();
+// ============================================
+// STENCIL PORTAL RENDERING
+// ============================================
 
-  const outerPortalZ = OUTER_PORTAL_Z;
-  const innerPortalZ = INNER_WORLD_OFFSET + INNER_PORTAL_Z;
+/**
+ * Render with stencil-based portal.
+ *
+ * The process:
+ * 1. Clear everything
+ * 2. Render portal quad to stencil only (marks portal region with value 1)
+ * 3. Render destination world only where stencil == 1 (with oblique clipping)
+ * 4. Render current world only where stencil != 1
+ */
+function renderWithStencilPortal(): void {
+  const currentPortal = isInInnerRoom ? innerPortal : outerPortal;
+  const destPortal = isInInnerRoom ? outerPortal : innerPortal;
+  const currentScene = isInInnerRoom ? innerScene : outerScene;
+  const destScene = isInInnerRoom ? outerScene : innerScene;
 
-  const portalOffset = innerPortalZ - outerPortalZ;
+  // Store original state
+  const originalAutoClear = renderer.autoClear;
+  renderer.autoClear = false;
 
-  if (isInInnerRoom) {
-    portalCamera.position.set(
-      mainCamPos.x,
-      mainCamPos.y,
-      mainCamPos.z - portalOffset
-    );
-  } else {
-    portalCamera.position.set(
-      mainCamPos.x,
-      mainCamPos.y,
-      mainCamPos.z + portalOffset
-    );
-  }
+  // 1. Clear everything
+  renderer.clear(true, true, true);
 
-  portalCamera.quaternion.copy(camera.quaternion);
+  // 2. Render portal to stencil buffer only
+  // The portal mesh already has stencilWrite: true, colorWrite: false, depthWrite: false
+  currentPortal.setStencilRef(1);
 
+  // Temporarily make only portal mesh visible for stencil pass
+  setSceneVisibility(currentScene, false);
+  currentPortal.mesh.visible = true;
+
+  renderer.render(currentScene, camera);
+
+  // Restore scene visibility
+  setSceneVisibility(currentScene, true);
+  currentPortal.mesh.visible = false; // Hide stencil mesh for normal render
+
+  // 3. Render destination world through portal (where stencil == 1)
+  // Setup portal camera
+  const destTransform = currentPortal.getDestinationCameraTransform(
+    camera.position,
+    camera.quaternion
+  );
+
+  portalCamera.copy(camera);
+  portalCamera.position.copy(destTransform.position);
+  portalCamera.quaternion.copy(destTransform.quaternion);
   portalCamera.updateMatrixWorld(true);
-  portalCamera.projectionMatrix.copy(camera.projectionMatrix);
 
-  // Set up clipping plane at the destination portal surface.
-  // This clips everything behind the portal in the destination world.
-  // The plane normal points toward the camera (into visible space).
-  if (isInInnerRoom) {
-    // Viewing outer world through portal - clip at outer portal Z
-    // Normal points +Z (toward where camera is in outer world)
-    portalClipPlane.setFromNormalAndCoplanarPoint(
-      new THREE.Vector3(0, 0, 1),
-      new THREE.Vector3(0, 0, outerPortalZ)
-    );
-  } else {
-    // Viewing inner world through portal - clip at inner portal Z
-    // Normal points -Z (toward where camera is in inner world)
-    portalClipPlane.setFromNormalAndCoplanarPoint(
-      new THREE.Vector3(0, 0, -1),
-      new THREE.Vector3(0, 0, innerPortalZ)
-    );
-  }
+  // Apply oblique projection (clips at destination portal plane)
+  const clipPlane = destPortal.getPlane();
+  clipPlane.negate(); // Point toward camera
+
+  const obliqueMatrix = computeObliqueProjectionMatrix(portalCamera, clipPlane);
+  portalCamera.projectionMatrix.copy(obliqueMatrix);
+  portalCamera.projectionMatrixInverse.copy(obliqueMatrix).invert();
+
+  // Set stencil test on destination scene materials
+  setSceneStencilTest(destScene, 1, THREE.EqualStencilFunc);
+
+  // Clear only depth (keep stencil), then render destination
+  renderer.clearDepth();
+  renderer.render(destScene, portalCamera);
+
+  // Reset stencil test
+  setSceneStencilTest(destScene, 0, THREE.AlwaysStencilFunc);
+
+  // 4. Render current world (where stencil != 1)
+  setSceneStencilTest(currentScene, 1, THREE.NotEqualStencilFunc);
+
+  // Clear depth again for current world
+  renderer.clearDepth();
+  renderer.render(currentScene, camera);
+
+  // Reset stencil test
+  setSceneStencilTest(currentScene, 0, THREE.AlwaysStencilFunc);
+
+  // Restore state
+  renderer.autoClear = originalAutoClear;
 }
 
-function updatePortalMesh(): void {
-  if (isInInnerRoom) {
-    portalMesh.position.set(0, 0, INNER_WORLD_OFFSET + INNER_PORTAL_Z);
-    portalMesh.rotation.set(0, Math.PI, 0);
-  } else {
-    portalMesh.position.set(0, 0, OUTER_PORTAL_Z);
-    portalMesh.rotation.set(0, 0, 0);
-  }
+function setSceneVisibility(scene: THREE.Scene, visible: boolean): void {
+  scene.traverse((obj) => {
+    if (obj instanceof THREE.Mesh || obj instanceof THREE.Light) {
+      obj.visible = visible;
+    }
+  });
+}
+
+function setSceneStencilTest(
+  scene: THREE.Scene,
+  stencilRef: number,
+  stencilFunc: THREE.StencilFunc
+): void {
+  scene.traverse((obj) => {
+    if (obj instanceof THREE.Mesh && obj.material) {
+      const materials = Array.isArray(obj.material)
+        ? obj.material
+        : [obj.material];
+      for (const mat of materials) {
+        mat.stencilWrite = false;
+        mat.stencilFunc = stencilFunc;
+        mat.stencilRef = stencilRef;
+      }
+    }
+  });
+}
+
+// ============================================
+// SPHERE ANIMATION
+// ============================================
+let sphereDistFromPortal = 0;
+
+function updateAnimatedSphere(currentTime: number): void {
+  if (!innerSphere || !outerSphere) return;
+
+  const t = currentTime * 0.001;
+  const travelRange = 3;
+  const cyclePos = Math.sin(t * 0.5) * travelRange - 1;
+
+  const localY = DOOR_HEIGHT * 0.5;
+  const localX = 0;
+
+  sphereDistFromPortal = cyclePos;
+
+  // Position spheres relative to their portals
+  outerSphere.position.set(
+    localX,
+    localY,
+    OUTER_PORTAL_Z + sphereDistFromPortal
+  );
+  innerSphere.position.set(
+    localX,
+    localY,
+    INNER_PORTAL_Z + sphereDistFromPortal
+  );
+
+  // Control visibility based on which side of portal
+  const SPHERE_RADIUS = 0.4;
+  const hasOutsidePart = sphereDistFromPortal > -SPHERE_RADIUS;
+  const hasInsidePart = sphereDistFromPortal < SPHERE_RADIUS;
+
+  // When rendering the outer world through portal (from inner), show outer sphere
+  // When rendering the inner world through portal (from outer), show inner sphere
+  outerSphere.visible = hasOutsidePart;
+  innerSphere.visible = hasInsidePart;
 }
 
 // ============================================
@@ -1088,6 +1201,7 @@ function update(currentTime: number): void {
   const deltaS = Math.min((currentTime - previousTime) / 1000, 0.033);
   previousTime = currentTime;
 
+  // Handle resize
   const pixelRatio = Math.min(window.devicePixelRatio, 2);
   if (resizeRendererToDisplaySize(renderer, pixelRatio)) {
     const width = renderer.domElement.clientWidth;
@@ -1097,12 +1211,6 @@ function update(currentTime: number): void {
     camera.updateProjectionMatrix();
     portalCamera.aspect = camera.aspect;
     portalCamera.updateProjectionMatrix();
-
-    if (width !== portalRenderWidth || height !== portalRenderHeight) {
-      portalRenderWidth = width;
-      portalRenderHeight = height;
-      portalRenderTarget.setSize(width, height);
-    }
   }
 
   // Update controller input
@@ -1116,97 +1224,31 @@ function update(currentTime: number): void {
     controller.jump();
   }
 
-  // Apply mouse look
   controller.rotate(pendingMouseX, pendingMouseY);
   pendingMouseX = 0;
   pendingMouseY = 0;
 
   controller.update(deltaS);
 
-  // Step physics world
+  // Step physics
   physicsWorld.step();
-
-  // Sync player position from physics
   controller.syncFromPhysics();
 
   // Check portal traversal
   checkPortalTraversal();
 
-  // Animate sphere through the portal
-  if (innerSphere && outerSphere) {
-    const t = currentTime * 0.001;
-
-    const travelRange = 3;
-    const cyclePos = Math.sin(t * 0.5) * travelRange - 1;
-
-    const localY = DOOR_HEIGHT * 0.5;
-    const localX = 0;
-
-    sphereDistFromPortal = cyclePos;
-
-    outerSphere.position.set(
-      localX,
-      localY,
-      OUTER_PORTAL_Z + sphereDistFromPortal
-    );
-    innerSphere.position.set(
-      localX,
-      localY,
-      INNER_PORTAL_Z + sphereDistFromPortal
-    );
-
-    innerSphere.visible = true;
-  }
-
-  // Update pushable cube
+  // Update animated objects
+  updateAnimatedSphere(currentTime);
   updatePushableCube();
 
   // Update camera
   const camPos = controller.getCameraPosition();
   camera.position.copy(camPos);
   camera.quaternion.copy(controller.getCameraQuaternion());
+  camera.updateMatrixWorld(true);
 
-  // Update portal
-  updatePortalMesh();
-
-  // Determine which scenes to render
-  const currentScene = isInInnerRoom ? innerScene : outerScene;
-  const portalScene = isInInnerRoom ? outerScene : innerScene;
-
-  // Update portal mesh parent
-  if (portalMesh.parent !== currentScene) {
-    portalMesh.removeFromParent();
-    currentScene.add(portalMesh);
-
-    if (DEBUG_PORTAL_OUTLINE && portalDebugOutline) {
-      portalDebugOutline.removeFromParent();
-      currentScene.add(portalDebugOutline);
-    }
-  }
-
-  // Update portal camera
-  camera.updateMatrixWorld();
-  updatePortalCamera();
-
-  // Control outerSphere visibility per render pass
-  const SPHERE_RADIUS = 0.4;
-  const sphereHasOutsidePart = sphereDistFromPortal > -SPHERE_RADIUS;
-
-  // Render portal view to texture with clipping plane
-  if (outerSphere) {
-    outerSphere.visible = isInInnerRoom;
-  }
-  renderer.clippingPlanes = [portalClipPlane];
-  renderer.setRenderTarget(portalRenderTarget);
-  renderer.render(portalScene, portalCamera);
-
-  // Render main scene (no clipping)
-  if (outerSphere) {
-    outerSphere.visible = !isInInnerRoom && sphereHasOutsidePart;
-  }
-  renderer.clippingPlanes = [];
-  renderer.setRenderTarget(null);
-  renderer.render(currentScene, camera);
+  // Render with stencil-based portals
+  renderWithStencilPortal();
 
   stats.end();
 }
@@ -1215,10 +1257,8 @@ function update(currentTime: number): void {
 // INITIALIZATION
 // ============================================
 async function init(): Promise<void> {
-  // Initialize Rapier
   await RAPIER.init();
 
-  // Create physics world
   physicsWorld = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
 
   const canvas = document.getElementById("canvas") as HTMLCanvasElement;
@@ -1231,28 +1271,16 @@ async function init(): Promise<void> {
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
-  renderer.localClippingEnabled = true;
 
   await renderer.init();
 
-  // Create render target for portal
-  portalRenderWidth = window.innerWidth;
-  portalRenderHeight = window.innerHeight;
-  portalRenderTarget = new RenderTarget(portalRenderWidth, portalRenderHeight, {
-    minFilter: THREE.LinearFilter,
-    magFilter: THREE.LinearFilter,
-    format: THREE.RGBAFormat,
-    type: THREE.HalfFloatType,
-  });
-
-  // Outer scene
+  // Create scenes
   outerScene = new THREE.Scene();
   outerScene.background = new THREE.Color(0x87ceeb);
   const outerWorld = createOuterWorld();
   outerScene.add(outerWorld);
   createLighting(outerScene, false);
 
-  // Inner scene
   innerScene = new THREE.Scene();
   innerScene.background = new THREE.Color(0x1a1510);
   const innerWorld = createInnerWorld();
@@ -1260,7 +1288,7 @@ async function init(): Promise<void> {
   innerScene.add(innerWorld);
   createLighting(innerScene, true);
 
-  // Cameras - use small near plane for portal transitions
+  // Cameras
   camera = new THREE.PerspectiveCamera(
     75,
     window.innerWidth / window.innerHeight,
@@ -1274,9 +1302,10 @@ async function init(): Promise<void> {
     200
   );
 
-  // Initialize portal clipping plane (will be updated each frame)
-  portalClipPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+  // Setup portals
+  setupPortals();
 
+  // Setup physics
   setupPhysics();
 
   // Create pushable cube visuals
@@ -1285,60 +1314,29 @@ async function init(): Promise<void> {
     PUSH_CUBE_SIZE,
     PUSH_CUBE_SIZE
   );
-  const pushCubeMaterial = new MeshStandardNodeMaterial();
-  pushCubeMaterial.colorNode = color(0xe07030);
-  pushCubeMaterial.roughnessNode = float(0.4);
-  pushCubeMaterial.metalnessNode = float(0.1);
 
-  pushCubeMeshOuter = new THREE.Mesh(pushCubeGeometry, pushCubeMaterial);
+  pushCubeOuterMaterial = createPushCubeMaterial(OUTER_PORTAL_Z, true);
+  pushCubeMeshOuter = new THREE.Mesh(pushCubeGeometry, pushCubeOuterMaterial);
   outerScene.add(pushCubeMeshOuter);
 
-  pushCubeMeshInner = new THREE.Mesh(
-    pushCubeGeometry,
-    pushCubeMaterial.clone()
+  pushCubeInnerMaterial = createPushCubeMaterial(
+    INNER_WORLD_OFFSET + INNER_PORTAL_Z,
+    false
   );
+  pushCubeMeshInner = new THREE.Mesh(pushCubeGeometry, pushCubeInnerMaterial);
   innerScene.add(pushCubeMeshInner);
 
-  // Portal plane
-  portalMesh = createPortalPlane(portalRenderTarget, DOOR_WIDTH, DOOR_HEIGHT);
-  portalMesh.position.set(0, 0, OUTER_PORTAL_Z - 0.005);
-  outerScene.add(portalMesh);
-
-  // Create outer sphere
+  // Create outer sphere (clipped version that appears in outer world)
   const outerSphereGeometry = new THREE.SphereGeometry(0.4, 32, 32);
-  const outerSphereMaterial = new MeshStandardNodeMaterial();
-  const hueShift2 = sin(time.mul(0.5)).mul(0.1).add(0.55);
-
-  const clipZ = float(OUTER_PORTAL_Z);
-  outerSphereMaterial.colorNode = Fn(() => {
-    If(positionWorld.z.lessThan(clipZ), () => {
-      Discard();
-    });
-    return vec3(hueShift2, float(0.3), float(0.7));
-  })();
-  outerSphereMaterial.roughnessNode = float(0.2);
-  outerSphereMaterial.metalnessNode = float(0.8);
-  outerSphereMaterial.emissiveNode = vec3(
-    hueShift2.mul(0.2),
-    float(0.05),
-    float(0.1)
-  );
+  outerSphereMaterial = createClippedSphereMaterial(OUTER_PORTAL_Z, true);
   outerSphere = new THREE.Mesh(outerSphereGeometry, outerSphereMaterial);
   outerSphere.visible = false;
   outerScene.add(outerSphere);
 
-  // Debug outline for portal
-  if (DEBUG_PORTAL_OUTLINE) {
-    portalDebugOutline = createPortalDebugOutline(DOOR_WIDTH, DOOR_HEIGHT);
-    portalDebugOutline.position.set(0, 0, OUTER_PORTAL_Z + 0.01);
-    outerScene.add(portalDebugOutline);
-  }
-
   setupInput();
 
-  // Stats panel
   stats = new Stats();
-  stats.showPanel(0); // 0: fps, 1: ms, 2: mb
+  stats.showPanel(0);
   document.body.appendChild(stats.dom);
 
   requestAnimationFrame(update);
