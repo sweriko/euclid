@@ -40,6 +40,7 @@ const GROUND_SIZE = 50;
 // Portal positions (z coordinate of the door plane)
 const OUTER_PORTAL_Z = 0.6;
 const INNER_PORTAL_Z = INNER_ROOM_DEPTH / 2;
+const PORTAL_MASK_EPSILON = 0.001;
 
 // Separate the inner world to avoid overlap (like Godot demo at z=48)
 const INNER_WORLD_OFFSET = 100;
@@ -193,13 +194,16 @@ function createStencilMaskMaterial(): MeshBasicNodeMaterial {
   const material = new MeshBasicNodeMaterial();
   material.colorWrite = false;
   material.depthWrite = false;
-  material.depthTest = false; // Don't test against portal scene's depth
+  // Depth-tested against a pre-pass of the CURRENT scene so the portal only
+  // exists where the portal plane is actually visible (occluders in front win).
+  material.depthTest = true;
   material.stencilWrite = true;
   material.stencilRef = 1;
   material.stencilFunc = THREE.AlwaysStencilFunc;
   material.stencilZPass = THREE.ReplaceStencilOp;
   material.stencilFail = THREE.KeepStencilOp;
   material.stencilZFail = THREE.KeepStencilOp;
+  material.stencilWriteMask = 0xff;
   material.side = THREE.DoubleSide;
   return material;
 }
@@ -209,6 +213,7 @@ function setStencilInsidePortal(material: THREE.Material): void {
   // In three.js, stencil test is only active when stencilWrite = true.
   // Keep ops so we don't modify the stencil buffer during this pass.
   material.stencilWrite = true;
+  material.stencilWriteMask = 0x00;
   material.stencilRef = 1;
   material.stencilFunc = THREE.EqualStencilFunc;
   material.stencilFail = THREE.KeepStencilOp;
@@ -220,6 +225,7 @@ function setStencilInsidePortal(material: THREE.Material): void {
 function setStencilOutsidePortal(material: THREE.Material): void {
   // Enable stencil test, but do not write/modify stencil values.
   material.stencilWrite = true;
+  material.stencilWriteMask = 0x00;
   material.stencilRef = 1;
   material.stencilFunc = THREE.NotEqualStencilFunc;
   material.stencilFail = THREE.KeepStencilOp;
@@ -230,6 +236,7 @@ function setStencilOutsidePortal(material: THREE.Material): void {
 // Clear stencil settings on a material
 function clearStencilSettings(material: THREE.Material): void {
   material.stencilWrite = false;
+  material.stencilWriteMask = 0xff;
   material.stencilFunc = THREE.AlwaysStencilFunc;
 }
 
@@ -271,6 +278,33 @@ function restoreVisibility(_scene: THREE.Scene): void {
     obj.visible = wasVisible;
   });
   visibilityCache.clear();
+}
+
+function renderSceneDepthOnly(scene: THREE.Scene, cam: THREE.Camera): void {
+  const materialState: Map<THREE.Material, boolean> = new Map();
+
+  scene.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (!mesh.isMesh || !mesh.material) return;
+
+    const materials = Array.isArray(mesh.material)
+      ? mesh.material
+      : [mesh.material];
+
+    materials.forEach((mat) => {
+      if (mat === stencilMaskMaterial) return;
+      if (!materialState.has(mat)) {
+        materialState.set(mat, mat.colorWrite);
+      }
+      mat.colorWrite = false;
+    });
+  });
+
+  renderer.render(scene, cam);
+
+  materialState.forEach((colorWrite, mat) => {
+    mat.colorWrite = colorWrite;
+  });
 }
 
 // Set stencil mode for all materials in a scene
@@ -413,6 +447,10 @@ function createDoorFrameGeometry(
 
   const merged = mergeGeometries(parts);
   parts.forEach((p) => p.dispose());
+
+  // Put the portal plane at local z=0 and keep the frame entirely on the
+  // "current side" (positive z) to avoid stencil/depth edge cases on the frame.
+  merged.translate(0, 0, frameDepth / 2);
 
   return merged;
 }
@@ -810,7 +848,8 @@ function createOuterDoorFrameCollision(): void {
 
   const postHeight = DOOR_HEIGHT + t;
   const postY = postHeight / 2;
-  const postZ = OUTER_PORTAL_Z;
+  // Frame geometry is shifted forward by d/2 (see createDoorFrameGeometry).
+  const postZ = OUTER_PORTAL_Z + d / 2;
 
   const addCollider = (
     hx: number,
@@ -1138,10 +1177,17 @@ function updatePortalCamera(): void {
 
 function updatePortalStencilMask(): void {
   if (isInInnerRoom) {
-    portalStencilMask.position.set(0, 0, INNER_WORLD_OFFSET + INNER_PORTAL_Z);
+    // Slightly beyond the inner front wall so the wall itself never gets stenciled.
+    portalStencilMask.position.set(
+      0,
+      0,
+      INNER_WORLD_OFFSET + INNER_PORTAL_Z + PORTAL_MASK_EPSILON
+    );
     portalStencilMask.rotation.set(0, Math.PI, 0);
   } else {
-    portalStencilMask.position.set(0, 0, OUTER_PORTAL_Z);
+    // Slightly behind the outer portal plane so the frame (z >= OUTER_PORTAL_Z)
+    // always wins the depth test and never gets cut by stencil.
+    portalStencilMask.position.set(0, 0, OUTER_PORTAL_Z - PORTAL_MASK_EPSILON);
     portalStencilMask.rotation.set(0, 0, 0);
   }
 }
@@ -1276,11 +1322,23 @@ function update(currentTime: number): void {
   setSceneStencilMode(portalScene, "none"); // No stencil test - render everywhere
   renderer.render(portalScene, portalCamera);
 
+  // Step 2.5: Clear depth (portalCamera depth is not comparable to main camera)
+  renderer.clear(false, true, false);
+
+  // Step 2.75: Depth pre-pass CURRENT scene (no color).
+  // This makes the stencil mask depth-aware so occluders (doorframe, sphere, etc.)
+  // prevent the portal from appearing on top of them.
+  portalStencilMask.visible = false;
+  if (outerSphere) {
+    outerSphere.visible = !isInInnerRoom && sphereHasOutsidePart;
+  }
+  setSceneStencilMode(currentScene, "none");
+  renderSceneDepthOnly(currentScene, camera);
+
   // Step 3: Render the stencil mask (marks portal opening with stencil=1)
-  // This uses the main camera so the mask aligns with where we see the portal
+  // This uses the main camera so the mask aligns with where we see the portal.
   portalStencilMask.visible = true;
   hideAllExcept(currentScene, portalStencilMask);
-  setSceneStencilMode(currentScene, "none");
   renderer.render(currentScene, camera);
   restoreVisibility(currentScene);
 
@@ -1399,7 +1457,7 @@ async function init(): Promise<void> {
 
   // Portal stencil mask
   portalStencilMask = createPortalStencilMask(DOOR_WIDTH, DOOR_HEIGHT);
-  portalStencilMask.position.set(0, 0, OUTER_PORTAL_Z);
+  portalStencilMask.position.set(0, 0, OUTER_PORTAL_Z - PORTAL_MASK_EPSILON);
   outerScene.add(portalStencilMask);
 
   // Create outer sphere
