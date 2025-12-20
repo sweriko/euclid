@@ -1,9 +1,12 @@
-import { WebGPURenderer } from 'three/webgpu';
+import { WebGPURenderer } from "three/webgpu";
 
 let previousWidth = 0;
 let previousHeight = 0;
 
-export function resizeRendererToDisplaySize(renderer: WebGPURenderer, pixelRatio: number) {
+export function resizeRendererToDisplaySize(
+  renderer: WebGPURenderer,
+  pixelRatio: number
+) {
   const canvas = renderer.domElement;
   const container = canvas.parentElement!;
   const width = container.clientWidth;
@@ -12,11 +15,10 @@ export function resizeRendererToDisplaySize(renderer: WebGPURenderer, pixelRatio
   if (needResize) {
     canvas.style.width = `${width}px`;
     canvas.style.height = `${height}px`;
+    renderer.setPixelRatio(pixelRatio);
     renderer.setSize(width, height, true);
-    renderer.setSize(Math.round(width * pixelRatio), Math.round(height * pixelRatio), false);
     previousWidth = width;
     previousHeight = height;
   }
   return needResize;
 }
-

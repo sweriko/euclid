@@ -86,6 +86,13 @@ let fullscreenCamera: THREE.OrthographicCamera;
 let fullscreenQuad: THREE.Mesh;
 let fullscreenMaterial: THREE.MeshBasicMaterial;
 
+// Dedicated scene for the portal stencil mask (avoid per-frame traversals/hide/show)
+let maskScene: THREE.Scene;
+
+// Cached unique materials per scene (avoid scene.traverse() each frame)
+let outerMaterials: THREE.Material[] = [];
+let innerMaterials: THREE.Material[] = [];
+
 // Pushable cube
 let pushCubeBody: RAPIER.RigidBody;
 let pushCubeMeshOuter: THREE.Mesh;
@@ -256,85 +263,55 @@ function initFullscreenBackground(): void {
   fullscreenScene.add(fullscreenQuad);
 }
 
-// Store original visibility for scene objects
-const visibilityCache: Map<THREE.Object3D, boolean> = new Map();
-
-// Hide all objects in scene except one
-function hideAllExcept(scene: THREE.Scene, except: THREE.Object3D): void {
-  visibilityCache.clear();
-  scene.traverse((obj) => {
-    if (obj !== except && obj !== scene) {
-      visibilityCache.set(obj, obj.visible);
-      if (obj.parent === scene || (obj as THREE.Mesh).isMesh) {
-        obj.visible = obj === except;
-      }
-    }
-  });
-}
-
-// Restore visibility after hideAllExcept
-function restoreVisibility(_scene: THREE.Scene): void {
-  visibilityCache.forEach((wasVisible, obj) => {
-    obj.visible = wasVisible;
-  });
-  visibilityCache.clear();
-}
-
-function renderSceneDepthOnly(scene: THREE.Scene, cam: THREE.Camera): void {
-  const materialState: Map<THREE.Material, boolean> = new Map();
-
+function collectSceneMaterials(scene: THREE.Scene): THREE.Material[] {
+  const set = new Set<THREE.Material>();
   scene.traverse((obj) => {
     const mesh = obj as THREE.Mesh;
     if (!mesh.isMesh || !mesh.material) return;
-
     const materials = Array.isArray(mesh.material)
       ? mesh.material
       : [mesh.material];
-
-    materials.forEach((mat) => {
-      if (mat === stencilMaskMaterial) return;
-      if (!materialState.has(mat)) {
-        materialState.set(mat, mat.colorWrite);
-      }
-      mat.colorWrite = false;
-    });
-  });
-
-  renderer.render(scene, cam);
-
-  materialState.forEach((colorWrite, mat) => {
-    mat.colorWrite = colorWrite;
-  });
-}
-
-// Set stencil mode for all materials in a scene
-function setSceneStencilMode(
-  scene: THREE.Scene,
-  mode: "none" | "inside" | "outside"
-): void {
-  scene.traverse((obj) => {
-    const mesh = obj as THREE.Mesh;
-    if (mesh.isMesh && mesh.material) {
-      const materials = Array.isArray(mesh.material)
-        ? mesh.material
-        : [mesh.material];
-      materials.forEach((mat) => {
-        if (mat === stencilMaskMaterial) return; // Don't modify the mask material
-
-        switch (mode) {
-          case "none":
-            clearStencilSettings(mat);
-            break;
-          case "inside":
-            setStencilInsidePortal(mat);
-            break;
-          case "outside":
-            setStencilOutsidePortal(mat);
-            break;
-        }
-      });
+    for (const mat of materials) {
+      if (mat === stencilMaskMaterial) continue;
+      set.add(mat);
     }
   });
+  return [...set];
+}
+
+function setMaterialsStencilMode(
+  materials: THREE.Material[],
+  mode: "none" | "inside" | "outside"
+): void {
+  for (const mat of materials) {
+    switch (mode) {
+      case "none":
+        clearStencilSettings(mat);
+        break;
+      case "inside":
+        setStencilInsidePortal(mat);
+        break;
+      case "outside":
+        setStencilOutsidePortal(mat);
+        break;
+    }
+  }
+}
+
+function renderSceneDepthOnly(
+  scene: THREE.Scene,
+  cam: THREE.Camera,
+  materials: THREE.Material[]
+): void {
+  const saved = new Array<boolean>(materials.length);
+  for (let i = 0; i < materials.length; i++) {
+    saved[i] = materials[i].colorWrite;
+    materials[i].colorWrite = false;
+  }
+  renderer.render(scene, cam);
+  for (let i = 0; i < materials.length; i++) {
+    materials[i].colorWrite = saved[i];
+  }
 }
 
 // ============================================
@@ -1148,8 +1125,6 @@ function teleportThroughPortal(): void {
 }
 
 function updatePortalCamera(): void {
-  const mainCamPos = camera.position.clone();
-
   const outerPortalZ = OUTER_PORTAL_Z;
   const innerPortalZ = INNER_WORLD_OFFSET + INNER_PORTAL_Z;
 
@@ -1157,15 +1132,15 @@ function updatePortalCamera(): void {
 
   if (isInInnerRoom) {
     portalCamera.position.set(
-      mainCamPos.x,
-      mainCamPos.y,
-      mainCamPos.z - portalOffset
+      camera.position.x,
+      camera.position.y,
+      camera.position.z - portalOffset
     );
   } else {
     portalCamera.position.set(
-      mainCamPos.x,
-      mainCamPos.y,
-      mainCamPos.z + portalOffset
+      camera.position.x,
+      camera.position.y,
+      camera.position.z + portalOffset
     );
   }
 
@@ -1204,7 +1179,9 @@ function update(currentTime: number): void {
   const deltaS = Math.min((currentTime - previousTime) / 1000, 0.033);
   previousTime = currentTime;
 
-  const pixelRatio = Math.min(window.devicePixelRatio, 2);
+  // Rendering the full scene multiple times per frame is fill-rate heavy.
+  // Clamp DPR aggressively to avoid tanking FPS on retina / integrated GPUs.
+  const pixelRatio = Math.min(window.devicePixelRatio, 1.25);
   if (resizeRendererToDisplaySize(renderer, pixelRatio)) {
     const width = renderer.domElement.clientWidth;
     const height = renderer.domElement.clientHeight;
@@ -1272,9 +1249,8 @@ function update(currentTime: number): void {
   updatePushableCube();
 
   // Update camera
-  const camPos = controller.getCameraPosition();
-  camera.position.copy(camPos);
-  camera.quaternion.copy(controller.getCameraQuaternion());
+  controller.getCameraPosition(camera.position);
+  controller.getCameraQuaternion(camera.quaternion);
 
   // Update portal stencil mask position
   updatePortalStencilMask();
@@ -1282,17 +1258,8 @@ function update(currentTime: number): void {
   // Determine which scenes to render
   const currentScene = isInInnerRoom ? innerScene : outerScene;
   const portalScene = isInInnerRoom ? outerScene : innerScene;
-
-  // Update portal stencil mask parent - always in current scene
-  if (portalStencilMask.parent !== currentScene) {
-    portalStencilMask.removeFromParent();
-    currentScene.add(portalStencilMask);
-
-    if (DEBUG_PORTAL_OUTLINE && portalDebugOutline) {
-      portalDebugOutline.removeFromParent();
-      currentScene.add(portalDebugOutline);
-    }
-  }
+  const currentMaterials = isInInnerRoom ? innerMaterials : outerMaterials;
+  const portalMaterials = isInInnerRoom ? outerMaterials : innerMaterials;
 
   // Update portal camera
   camera.updateMatrixWorld();
@@ -1319,7 +1286,7 @@ function update(currentTime: number): void {
   if (outerSphere) {
     outerSphere.visible = isInInnerRoom; // Show outer sphere when looking from inner
   }
-  setSceneStencilMode(portalScene, "none"); // No stencil test - render everywhere
+  setMaterialsStencilMode(portalMaterials, "none"); // No stencil test - render everywhere
   renderer.render(portalScene, portalCamera);
 
   // Step 2.5: Clear depth (portalCamera depth is not comparable to main camera)
@@ -1332,15 +1299,13 @@ function update(currentTime: number): void {
   if (outerSphere) {
     outerSphere.visible = !isInInnerRoom && sphereHasOutsidePart;
   }
-  setSceneStencilMode(currentScene, "none");
-  renderSceneDepthOnly(currentScene, camera);
+  setMaterialsStencilMode(currentMaterials, "none");
+  renderSceneDepthOnly(currentScene, camera, currentMaterials);
 
   // Step 3: Render the stencil mask (marks portal opening with stencil=1)
   // This uses the main camera so the mask aligns with where we see the portal.
   portalStencilMask.visible = true;
-  hideAllExcept(currentScene, portalStencilMask);
-  renderer.render(currentScene, camera);
-  restoreVisibility(currentScene);
+  renderer.render(maskScene, camera);
 
   // Step 4: Clear depth only (keep color from portal scene, keep stencil)
   // This allows current scene to render with correct depth ordering
@@ -1362,12 +1327,12 @@ function update(currentTime: number): void {
   if (outerSphere) {
     outerSphere.visible = !isInInnerRoom && sphereHasOutsidePart;
   }
-  setSceneStencilMode(currentScene, "outside"); // Only render where stencil != 1
+  setMaterialsStencilMode(currentMaterials, "outside"); // Only render where stencil != 1
   renderer.render(currentScene, camera);
 
   // Step 6: Clear stencil settings for next frame
-  setSceneStencilMode(currentScene, "none");
-  setSceneStencilMode(portalScene, "none");
+  setMaterialsStencilMode(currentMaterials, "none");
+  setMaterialsStencilMode(portalMaterials, "none");
   clearStencilSettings(fullscreenMaterial);
 
   currentScene.background = currentBackground;
@@ -1392,7 +1357,7 @@ async function init(): Promise<void> {
     antialias: true,
     stencil: true, // Enable stencil buffer
   });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
@@ -1458,7 +1423,8 @@ async function init(): Promise<void> {
   // Portal stencil mask
   portalStencilMask = createPortalStencilMask(DOOR_WIDTH, DOOR_HEIGHT);
   portalStencilMask.position.set(0, 0, OUTER_PORTAL_Z - PORTAL_MASK_EPSILON);
-  outerScene.add(portalStencilMask);
+  maskScene = new THREE.Scene();
+  maskScene.add(portalStencilMask);
 
   // Create outer sphere
   const outerSphereGeometry = new THREE.SphereGeometry(0.4, 32, 32);
@@ -1487,8 +1453,12 @@ async function init(): Promise<void> {
   if (DEBUG_PORTAL_OUTLINE) {
     portalDebugOutline = createPortalDebugOutline(DOOR_WIDTH, DOOR_HEIGHT);
     portalDebugOutline.position.set(0, 0, OUTER_PORTAL_Z + 0.01);
-    outerScene.add(portalDebugOutline);
+    maskScene.add(portalDebugOutline);
   }
+
+  // Cache materials once (avoid per-frame scene traversal)
+  outerMaterials = collectSceneMaterials(outerScene);
+  innerMaterials = collectSceneMaterials(innerScene);
 
   setupInput();
 
