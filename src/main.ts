@@ -68,6 +68,7 @@ let outerScene: THREE.Scene;
 let innerScene: THREE.Scene;
 let camera: THREE.PerspectiveCamera;
 let portalCamera: THREE.PerspectiveCamera;
+let maskCamera: THREE.PerspectiveCamera; // Dedicated camera for stencil mask with tiny near plane
 let physicsWorld: RAPIER.World;
 let controller: FPSController;
 let portalStencilMask: THREE.Mesh; // Portal mask (writes to stencil only)
@@ -163,10 +164,10 @@ function createInnerRoomMaterial(): MeshStandardNodeMaterial {
   material.metalnessNode = float(0.05);
   material.side = THREE.DoubleSide;
 
-  // Prevent z-fighting with door frames
+  // Push room surfaces back more than portal mask (factor=1) so portal wins at edges
   material.polygonOffset = true;
-  material.polygonOffsetFactor = 1;
-  material.polygonOffsetUnits = 1;
+  material.polygonOffsetFactor = 2;
+  material.polygonOffsetUnits = 2;
 
   return material;
 }
@@ -187,10 +188,10 @@ function createGroundMaterial(): MeshStandardNodeMaterial {
   material.roughnessNode = float(0.9);
   material.metalnessNode = float(0.0);
 
-  // Prevent z-fighting with door frames and other geometry at floor level
+  // Push ground back more than portal mask (factor=1) so portal wins at y=0 edge
   material.polygonOffset = true;
-  material.polygonOffsetFactor = 1;
-  material.polygonOffsetUnits = 1;
+  material.polygonOffsetFactor = 2;
+  material.polygonOffsetUnits = 2;
 
   return material;
 }
@@ -1189,6 +1190,8 @@ function update(currentTime: number): void {
     camera.updateProjectionMatrix();
     portalCamera.aspect = camera.aspect;
     portalCamera.updateProjectionMatrix();
+    maskCamera.aspect = camera.aspect;
+    maskCamera.updateProjectionMatrix();
   }
 
   // Update controller input
@@ -1291,20 +1294,26 @@ function update(currentTime: number): void {
   // Step 2.5: Clear depth (portalCamera depth is not comparable to main camera)
   renderer.clear(false, true, false);
 
+  // Sync maskCamera transform for upcoming passes
+  maskCamera.position.copy(camera.position);
+  maskCamera.quaternion.copy(camera.quaternion);
+  maskCamera.updateMatrixWorld();
+
   // Step 2.75: Depth pre-pass CURRENT scene (no color).
   // This makes the stencil mask depth-aware so occluders (doorframe, sphere, etc.)
   // prevent the portal from appearing on top of them.
+  // IMPORTANT: Use maskCamera so depth values match the mask pass (same near/far).
   portalStencilMask.visible = false;
   if (outerSphere) {
     outerSphere.visible = !isInInnerRoom && sphereHasOutsidePart;
   }
   setMaterialsStencilMode(currentMaterials, "none");
-  renderSceneDepthOnly(currentScene, camera, currentMaterials);
+  renderSceneDepthOnly(currentScene, maskCamera, currentMaterials);
 
   // Step 3: Render the stencil mask (marks portal opening with stencil=1)
-  // This uses the main camera so the mask aligns with where we see the portal.
+  // Uses maskCamera (tiny near plane) so portal doesn't clip when very close.
   portalStencilMask.visible = true;
-  renderer.render(maskScene, camera);
+  renderer.render(maskScene, maskCamera);
 
   // Step 4: Clear depth only (keep color from portal scene, keep stencil)
   // This allows current scene to render with correct depth ordering
@@ -1395,6 +1404,13 @@ async function init(): Promise<void> {
     window.innerWidth / window.innerHeight,
     0.1,
     200
+  );
+  // Mask camera with tiny near plane - prevents portal clipping when close
+  maskCamera = new THREE.PerspectiveCamera(
+    75,
+    window.innerWidth / window.innerHeight,
+    0.001,
+    10 // Short far plane is fine, we only need it for the portal surface
   );
 
   setupPhysics();
