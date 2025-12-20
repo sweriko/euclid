@@ -40,7 +40,6 @@ const GROUND_SIZE = 50;
 // Portal positions (z coordinate of the door plane)
 const OUTER_PORTAL_Z = 0.6;
 const INNER_PORTAL_Z = INNER_ROOM_DEPTH / 2;
-const PORTAL_MASK_EPSILON = 0.001;
 
 // Separate the inner world to avoid overlap (like Godot demo at z=48)
 const INNER_WORLD_OFFSET = 100;
@@ -204,6 +203,11 @@ function createStencilMaskMaterial(): MeshBasicNodeMaterial {
   // Depth-tested against a pre-pass of the CURRENT scene so the portal only
   // exists where the portal plane is actually visible (occluders in front win).
   material.depthTest = true;
+  // Keep the mask coplanar with the portal plane but ensure frame/walls at the
+  // same depth win the depth test, so they never get stenciled.
+  material.polygonOffset = true;
+  material.polygonOffsetFactor = 1;
+  material.polygonOffsetUnits = 1;
   material.stencilWrite = true;
   material.stencilRef = 1;
   material.stencilFunc = THREE.AlwaysStencilFunc;
@@ -1152,17 +1156,12 @@ function updatePortalCamera(): void {
 
 function updatePortalStencilMask(): void {
   if (isInInnerRoom) {
-    // Slightly beyond the inner front wall so the wall itself never gets stenciled.
-    portalStencilMask.position.set(
-      0,
-      0,
-      INNER_WORLD_OFFSET + INNER_PORTAL_Z + PORTAL_MASK_EPSILON
-    );
+    // Keep coplanar with the inner portal plane; depth bias is handled via polygonOffset.
+    portalStencilMask.position.set(0, 0, INNER_WORLD_OFFSET + INNER_PORTAL_Z);
     portalStencilMask.rotation.set(0, Math.PI, 0);
   } else {
-    // Slightly behind the outer portal plane so the frame (z >= OUTER_PORTAL_Z)
-    // always wins the depth test and never gets cut by stencil.
-    portalStencilMask.position.set(0, 0, OUTER_PORTAL_Z - PORTAL_MASK_EPSILON);
+    // Keep coplanar with the outer portal plane; depth bias is handled via polygonOffset.
+    portalStencilMask.position.set(0, 0, OUTER_PORTAL_Z);
     portalStencilMask.rotation.set(0, 0, 0);
   }
 }
@@ -1422,7 +1421,7 @@ async function init(): Promise<void> {
 
   // Portal stencil mask
   portalStencilMask = createPortalStencilMask(DOOR_WIDTH, DOOR_HEIGHT);
-  portalStencilMask.position.set(0, 0, OUTER_PORTAL_Z - PORTAL_MASK_EPSILON);
+  portalStencilMask.position.set(0, 0, OUTER_PORTAL_Z);
   maskScene = new THREE.Scene();
   maskScene.add(portalStencilMask);
 
@@ -1452,7 +1451,7 @@ async function init(): Promise<void> {
   // Debug outline for portal
   if (DEBUG_PORTAL_OUTLINE) {
     portalDebugOutline = createPortalDebugOutline(DOOR_WIDTH, DOOR_HEIGHT);
-    portalDebugOutline.position.set(0, 0, OUTER_PORTAL_Z + 0.01);
+    portalDebugOutline.position.set(0, 0, OUTER_PORTAL_Z);
     maskScene.add(portalDebugOutline);
   }
 
